@@ -1,0 +1,40 @@
+# Python 运行时与缓存
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+venv/
+
+# IDE 配置
+.idea/
+.vscode/
+
+# 构建产物：双库可由 python -m src.data.pipeline 整库全量重建
+db/
+data/processed/
+# 摄取层临时工作区：投放待处理文件与变更快照（正式产物经写库通道进 db/ 权威主库）
+data/incoming/
+
+# 临时验证产物（依赖冲突演练、空跑输出等，交付前清理）
+_tmp_*
+
+# 本地模型权重：bge 向量模型可由 HF 缓存经 model.save() 重新导出，不入库
+models/
+
+# 敏感配置：大模型 API Key 等，禁止提交
+.env
+.env.*
+
+# 本地测试报告：仅本地保留，不入库
+联网搜索工具测试报告.md
+docs/reranker优化测试报告.md
+docs/系统评测报告.md
+
+# 评测中间产物：报告生成后可删
+tests/_eval_out/
+data/eval/results*/
+
+# 系统与日志
+.DS_Store
+*.log
+logs/

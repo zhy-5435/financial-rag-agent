@@ -1,0 +1,166 @@
+"""双路混合检索编排：向量语义召回 + FTS5 关键词召回 → 去重补齐 → 加权排序
+
+检索链路（金融场景「精准优先」）：
+    用户提问
+        ├─ 向量检索（Milvus Lite）  → 语义召回 Top CANDIDATE_TOP_K
+        ├─ 关键词检索（SQLite FTS5）→ 精准召回 Top CANDIDATE_TOP_K
+        └─ 两路结果去重 → 加权排序 → 输出 Top K
+
+综合得分 = 归一化向量相似度 × VECTOR_WEIGHT + 归一化关键词得分 × KEYWORD_WEIGHT；
+向量相似度（BGE 余弦常压缩在 0.5~0.75）与关键词得分（铺满 0~1）量纲不一致，
+直接加权会放大关键词噪声、把向量路正确 Top1 挤掉，故两路得分先各自按当次查询
+候选集做 min-max 归一化到 [0,1] 再加权，保证同量纲可比；
+仅关键词路命中的切片按查询向量补算余弦相似度，保证两路得分口径一致；
+FTS5 不可用时自动退化为纯向量检索（关键词项记 0），仍走统一的归一化加权打分，
+保证 score 口径与双路一致、跨查询可比，出参统一携带 similarity / keyword_score / score。
+"""
+from src.data.config import (
+    CANDIDATE_TOP_K,
+    DEDUP_ENABLED,
+    DEDUP_JACCARD,
+    DEDUP_POOL_K,
+    KEYWORD_WEIGHT,
+    RERANK_CANDIDATE_K,
+    RERANK_ENABLED,
+    TOP_K,
+    VECTOR_WEIGHT,
+)
+import re
+from src.data.milvus_client import milvus_store
+from src.data.reranker import reranker_service
+from src.data.sqlite_client import sqlite_client
+
+
+class HybridRetriever:
+    def search(self, query: str, top_k: int = TOP_K) -> list[dict]:
+        """双路混合检索主入口，出参结构兼容原向量检索结果，附加综合得分
+
+        排序链路：双路召回 → 去重补齐 → 归一化加权排序 → （可选）Reranker 精排 → 截断 Top K。
+        无论关键词路是否可用，score 一律经 `_apply_scores` 统一计算（归一化相似度和归一化
+        关键词得分加权），杜绝退化路径与双路路径 score 量纲不一致。
+        """
+        # 1) 双路召回
+        vec_hits = milvus_store.search(query, top_k=CANDIDATE_TOP_K)
+        kw_hits = sqlite_client.keyword_search(query, top_k=CANDIDATE_TOP_K)
+
+        # 2) 去重合并：向量路条目补关键词得分，仅关键词路命中的条目补算向量相似度；
+        #    关键词路整体不可用（FTS5 缺失/无词元命中）时退化为纯向量，补齐 keyword_score=0
+        if kw_hits:
+            merged = self._merge_candidates(query, vec_hits, kw_hits)
+        else:
+            merged = [{**h, "keyword_score": 0.0} for h in vec_hits]
+
+        # 3) 两路得分同量纲校准后加权排序（退化路径关键词项自然为 0）
+        self._apply_scores(merged)
+        # 综合得分并列时以原始向量相似度兜底（min-max 为保序线性变换，等价于按原始相似度破平）
+        merged.sort(key=lambda x: (x["score"], x["similarity"]), reverse=True)
+        # 4) 近重复多样性折叠：跨文档逐字/近似孪生副本不占头部槽位（P1）
+        if DEDUP_ENABLED:
+            merged = self._diversify(merged)
+        return self._rerank(query, merged, top_k)
+
+    @staticmethod
+    def _merge_candidates(query: str, vec_hits: list[dict], kw_hits: list[dict]) -> list[dict]:
+        """去重合并双路候选：向量路补 keyword_score，仅关键词路命中的按查询向量补算相似度"""
+        kw_score_map = {h["knowledge_id"]: h["keyword_score"] for h in kw_hits}
+        vec_ids = {h["knowledge_id"] for h in vec_hits}
+        kw_only = [h for h in kw_hits if h["knowledge_id"] not in vec_ids]
+        sim_map = (
+            milvus_store.get_similarity_by_ids(query, [h["knowledge_id"] for h in kw_only])
+            if kw_only else {}
+        )
+        merged = []
+        for h in vec_hits:
+            merged.append({**h, "keyword_score": kw_score_map.get(h["knowledge_id"], 0.0)})
+        for h in kw_only:
+            # coverage 仅为关键词路内部弱命中诊断字段，不透出到最终出参
+            hit = {k: v for k, v in h.items() if k != "coverage"}
+            hit["similarity"] = sim_map.get(h["knowledge_id"], 0.0)
+            merged.append(hit)
+        return merged
+
+    @classmethod
+    def _apply_scores(cls, merged: list[dict]) -> None:
+        """对候选集就地写入综合得分：两路得分各按当次查询做 min-max 归一化后加权
+
+        纯向量退化路径与双路共用本方法，保证 score 计算口径一致、跨查询可比。
+        """
+        sim_norm = cls._minmax([h["similarity"] for h in merged])
+        kw_norm = cls._minmax([h["keyword_score"] for h in merged])
+        for h in merged:
+            h["score"] = round(
+                sim_norm[h["similarity"]] * VECTOR_WEIGHT
+                + kw_norm[h["keyword_score"]] * KEYWORD_WEIGHT,
+                4,
+            )
+
+    def _rerank(self, query: str, ranked: list[dict], top_k: int) -> list[dict]:
+        """对加权排序后的候选集做 Reranker 精排，再截断 Top K
+
+        仅取排序前 RERANK_CANDIDATE_K 条送交叉编码器逐对打分，按精排得分重排；
+        未开启或模型不可用时原序返回（不额外挂 rerank_score 字段），保证零副作用降级。
+        """
+        if not ranked or not RERANK_ENABLED or not reranker_service.available:
+            return ranked[:top_k]
+        pool = ranked[:RERANK_CANDIDATE_K]
+        scores = reranker_service.scores(query, [h["content"] for h in pool])
+        if not scores:
+            return ranked[:top_k]
+        for h, s in zip(pool, scores):
+            h["rerank_score"] = round(s, 4)
+        # 精排得分为主序，并列时回退加权综合得分兜底
+        pool.sort(key=lambda x: (x["rerank_score"], x["score"]), reverse=True)
+        return pool[:top_k]
+
+    @classmethod
+    def _diversify(cls, ranked: list[dict]) -> list[dict]:
+        """贪心近重复折叠：按当前（已加权降序）顺序保留候选，跳过与某已保留切片
+        文本近重复者，使被跨文档孪生副本挤到 rank4+ 的不同内容顶进头部。
+        仅对排序前 DEDUP_POOL_K 条两两比对；以逐字 original_text 为比对口径（不含
+        文档标题前缀，避免同一条款因标题不同而判不重复）；被折叠者不丢弃、仅后置（保 recall 不变）。
+        """
+        pool = ranked[:DEDUP_POOL_K]
+        rest = ranked[DEDUP_POOL_K:]
+        kept: list[dict] = []
+        kept_sets: list[set] = []
+        for h in pool:
+            bg = cls._char_bigrams(h.get("original_text") or h.get("content") or "")
+            if any(cls._jaccard(bg, kb) >= DEDUP_JACCARD for kb in kept_sets):
+                rest.append(h)  # 折叠不丢弃：排到池尾，仍参与后续精排/回探，不损失召回
+                continue
+            kept.append(h)
+            kept_sets.append(bg)
+        return kept + rest
+
+    @staticmethod
+    def _char_bigrams(text: str) -> set:
+        s = re.sub(r"\s+", "", text)
+        if len(s) < 2:
+            return {s} if s else set()
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+
+    @staticmethod
+    def _jaccard(a: set, b: set) -> float:
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
+    @staticmethod
+    def _minmax(values: list[float]) -> dict[float, float]:
+        """返回 {原始值: 归一化值}；空集返回空表。
+
+        全集同值（跨度为 0，min-max 无定义）时按取值本身判定：正得分记 1.0（该值即当次候选
+        的最优，纯向量单命中不应被归零），0 分记 0.0（该路无信号，如退化路径的关键词项）。
+        对存在跨度的候选集仍为标准 min-max（保序线性变换），不改变已验证的排序行为。
+        """
+        if not values:
+            return {}
+        lo, hi = min(values), max(values)
+        span = hi - lo
+        if span < 1e-9:
+            return {v: (1.0 if v > 0 else 0.0) for v in values}
+        return {v: (v - lo) / span for v in values}
+
+
+# 全局实例
+hybrid_retriever = HybridRetriever()

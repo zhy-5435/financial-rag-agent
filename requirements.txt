@@ -1,0 +1,20 @@
+pymilvus>=2.4.10
+pandas>=2.0.0
+sentence-transformers>=2.2.2
+# torch 默认随依赖装 CPU 版；NVIDIA 独显（如 RTX 4060）整库重嵌提速可换 CUDA 构建：
+# pip install torch --index-url https://download.pytorch.org/whl/cu124
+python-dateutil>=2.8.2
+numpy>=1.24.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+langchain>=1.0.0
+langchain-openai>=1.0.0
+langgraph>=1.0.0
+python-dotenv>=1.0.0
+redis>=5.0.0
+llama-index-core>=0.12.52
+llama-index-readers-file>=0.4.8   # PDF/pypdf 解析；PPTX/DOCX 需下列 extras
+python-pptx>=1.0.2                # PPTX 解析（readers-file extras，需显式安装）
+docx2txt>=0.8                     # DOCX 解析（readers-file extras，需显式安装）
